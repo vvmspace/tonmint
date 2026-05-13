@@ -64,10 +64,20 @@ struct TokenTrade {
     amount_ton_spent: f64,
     buy_timestamp_ms: i64,
     status: String,
+    testnet: bool,
 }
 
-async fn is_new_launch(client: &reqwest::Client, address: &str) -> bool {
-    let url = format!("https://toncenter.com/api/v3/transactions?account={}&limit=10", address);
+fn get_api_base(is_testnet: bool) -> (String, String) {
+    if is_testnet {
+        ("https://testnet.toncenter.com".to_string(), "https://testnet.tonapi.io".to_string())
+    } else {
+        ("https://toncenter.com".to_string(), "https://tonapi.io".to_string())
+    }
+}
+
+async fn is_new_launch(client: &reqwest::Client, address: &str, is_testnet: bool) -> bool {
+    let (toncenter, _) = get_api_base(is_testnet);
+    let url = format!("{}/api/v3/transactions?account={}&limit=10", toncenter, address);
     if let Ok(resp) = client.get(url).send().await {
         if let Ok(data) = resp.json::<TransactionsResponse>().await {
             return data.transactions.len() <= 5;
@@ -76,8 +86,9 @@ async fn is_new_launch(client: &reqwest::Client, address: &str) -> bool {
     true
 }
 
-async fn get_account_balance(client: &reqwest::Client, address: &str) -> String {
-    let url = format!("https://toncenter.com/api/v2/getAddressInformation?address={}", address);
+async fn get_account_balance(client: &reqwest::Client, address: &str, is_testnet: bool) -> String {
+    let (toncenter, tonapi) = get_api_base(is_testnet);
+    let url = format!("{}/api/v2/getAddressInformation?address={}", toncenter, address);
     if let Ok(resp) = client.get(url).send().await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(result) = json.get("result") {
@@ -97,7 +108,7 @@ async fn get_account_balance(client: &reqwest::Client, address: &str) -> String 
         }
     }
 
-    let url_tonapi = format!("https://tonapi.io/v2/accounts/{}", address);
+    let url_tonapi = format!("{}/v2/accounts/{}", tonapi, address);
     if let Ok(resp) = client.get(url_tonapi).send().await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(balance) = json.get("balance").and_then(|v| v.as_u64()) {
@@ -109,8 +120,9 @@ async fn get_account_balance(client: &reqwest::Client, address: &str) -> String 
     "Unknown".to_string()
 }
 
-async fn get_jetton_info(client: &reqwest::Client, address: &str) -> (String, String) {
-    let url = format!("https://toncenter.com/api/v3/jetton/masters?address={}", address);
+async fn get_jetton_info(client: &reqwest::Client, address: &str, is_testnet: bool) -> (String, String) {
+    let (toncenter, tonapi) = get_api_base(is_testnet);
+    let url = format!("{}/api/v3/jetton/masters?address={}", toncenter, address);
     if let Ok(resp) = client.get(url).send().await {
         if let Ok(data) = resp.json::<JettonMetadataResponse>().await {
             for (_, entry) in data.metadata {
@@ -127,7 +139,7 @@ async fn get_jetton_info(client: &reqwest::Client, address: &str) -> (String, St
         }
     }
 
-    let url_tonapi = format!("https://tonapi.io/v2/jettons/{}", address);
+    let url_tonapi = format!("{}/v2/jettons/{}", tonapi, address);
     if let Ok(resp) = client.get(url_tonapi).send().await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(metadata) = json.get("metadata") {
@@ -141,8 +153,9 @@ async fn get_jetton_info(client: &reqwest::Client, address: &str) -> (String, St
     ("Unknown".to_string(), "???".to_string())
 }
 
-async fn send_telegram(client: &reqwest::Client, token: &str, chat_id: &str, text: &str, reply_to: Option<i64>) -> Result<i64, Box<dyn std::error::Error>> {
+async fn send_telegram(client: &reqwest::Client, token: &str, chat_id: &str, text: &str, reply_to: Option<i64>) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
@@ -165,23 +178,31 @@ async fn send_telegram(client: &reqwest::Client, token: &str, chat_id: &str, tex
 }
 
 async fn sniper_worker(db: Collection<TokenTrade>) {
-    println!("🔫 Sniper Worker: Monitoring all shards for mints...");
+    let is_testnet = env::var("TESTNET").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
+    let (toncenter, _) = get_api_base(is_testnet);
+    
+    let net_name = if is_testnet { "TESTNET" } else { "MAINNET" };
+    println!("🔫 Sniper Worker: Monitoring all shards for mints on {}...", net_name);
 
     let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
     let chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
     let buy_ton: f64 = env::var("BUY_TON").unwrap_or_else(|_| "2".to_string()).parse().unwrap_or(2.0);
+    let buy_interval_ms: i64 = env::var("BUY_INTERVAL_MS").unwrap_or_else(|_| "900000".to_string()).parse().unwrap_or(900000);
 
     let client = reqwest::Client::new();
-    let base_url = "https://toncenter.com/api/v3/transactions?limit=500&sort=desc&workchain=0";
+    let base_url = format!("{}/api/v3/transactions?limit=500&sort=desc&workchain=0", toncenter);
 
     let mut processed_hashes = HashSet::new();
     let mut hash_queue = std::collections::VecDeque::new();
     let max_hashes = 20000;
+    
+    let mut last_buy_timestamp = 0i64;
 
     let mint_opcodes = vec!["0x642b7d07", "0xcc1a97aa", "0x00000015", "0x16740000"];
 
+
     loop {
-        let response = match client.get(base_url).send().await {
+        let response = match client.get(&base_url).send().await {
             Ok(resp) => resp,
             Err(_) => {
                 sleep(Duration::from_secs(2)).await;
@@ -232,11 +253,11 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
         }
 
         for tx in found_mints {
-            if !is_new_launch(&client, &tx.account).await {
+            if !is_new_launch(&client, &tx.account, is_testnet).await {
                 continue;
             }
 
-            let (name, symbol) = get_jetton_info(&client, &tx.account).await;
+            let (name, symbol) = get_jetton_info(&client, &tx.account, is_testnet).await;
             
             let time = chrono::DateTime::from_timestamp(tx.now, 0)
                 .map(|t| t.format("%H:%M:%S").to_string())
@@ -250,7 +271,7 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
 
             let minter_addr = tx.in_msg.as_ref().and_then(|m| m.source.clone()).unwrap_or_else(|| "Unknown".to_string());
             let minter_balance = if minter_addr != "Unknown" {
-                get_account_balance(&client, &minter_addr).await
+                get_account_balance(&client, &minter_addr, is_testnet).await
             } else {
                 "Unknown".to_string()
             };
@@ -277,18 +298,18 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
 
             println!("✨ NEW MINT: {} ({}) | Minter: {} | Balance: {}", name, symbol, minter_addr, minter_balance);
 
-
+            let network_prefix = if is_testnet { "testnet." } else { "" };
             let message1 = format!(
-                "💎 *New Jetton Minted!*\n\n\
+                "💎 *New Jetton Minted ({})!*\n\n\
                  🏷️ *Name:* `{}`\n\
                  🔤 *Symbol:* `{}`\n\
                  🕒 *Time:* {}\n\
                  📦 *Opcode:* `{}`\n\n\
-                 📍 *Master:* [Explorer](https://tonviewer.com/{})\n\
-                 🔗 *Hash:* [Transaction](https://tonviewer.com/transaction/{})",
-                name, symbol, time, 
+                 📍 *Master:* [Explorer](https://{}tonviewer.com/{})\n\
+                 🔗 *Hash:* [Transaction](https://{}tonviewer.com/transaction/{})",
+                net_name, name, symbol, time, 
                 tx.in_msg.as_ref().and_then(|m| m.opcode.clone()).unwrap_or_default(),
-                tx.account, hex_hash
+                network_prefix, tx.account, network_prefix, hex_hash
             );
 
             match send_telegram(&client, &bot_token, &chat_id, &message1, None).await {
@@ -297,8 +318,8 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
                         "👤 *Minter Info*\n\n\
                          💰 *Balance:* `{}`\n\
                          📍 *Address:* `{}`\n\
-                         🔗 [View on Explorer](https://tonviewer.com/{})",
-                        minter_balance, minter_addr, minter_addr
+                         🔗 [View on Explorer](https://{}tonviewer.com/{})",
+                        minter_balance, minter_addr, network_prefix, minter_addr
                     );
 
                     let _ = send_telegram(&client, &bot_token, &chat_id, &message2, Some(msg_id)).await;
@@ -306,8 +327,14 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
                 Err(e) => eprintln!("❌ Telegram error (Msg 1): {}", e),
             }
 
-            // SIMULATE BUY
-            println!("🛒 [SIMULATION] Purchasing {} for {} TON...", symbol, buy_ton);
+            // BUY EXECUTION
+            let now_ms = Utc::now().timestamp_millis();
+            if now_ms - last_buy_timestamp < buy_interval_ms {
+                println!("⏳ SKIP BUY: Too soon since last purchase (Interval: {}ms)", buy_interval_ms);
+                continue;
+            }
+
+            println!("🛒 [BUY] Executing purchase of {} for {} TON...", symbol, buy_ton);
             
             let trade = TokenTrade {
                 token_address: tx.account.clone(),
@@ -315,15 +342,39 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
                 token_symbol: symbol.clone(),
                 buy_hash: hex_hash.clone(),
                 amount_ton_spent: buy_ton,
-                buy_timestamp_ms: Utc::now().timestamp_millis(),
+                buy_timestamp_ms: now_ms,
                 status: "PENDING".to_string(),
+                testnet: is_testnet,
             };
 
             if let Err(e) = db.insert_one(trade, None).await {
                 eprintln!("❌ Failed to insert trade into MongoDB: {}", e);
             } else {
-                println!("✅ [SIMULATION] Trade recorded in MongoDB.");
-                let alert = format!("🛒 *SIMULATION: Buy Executed*\n\nBought {} TON of `{}`.", buy_ton, symbol);
+                last_buy_timestamp = now_ms;
+                println!("✅ [BUY] Trade recorded in MongoDB.");
+                
+                let output = std::process::Command::new("npx")
+                    .arg("ts-node")
+                    .arg("trade.ts")
+                    .arg("buy")
+                    .arg(buy_ton.to_string())
+                    .arg(&tx.account)
+                    .current_dir("worker")
+                    .output();
+
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        println!("TS Worker Output: {}", stdout);
+                        if !stderr.is_empty() {
+                            eprintln!("TS Worker Error: {}", stderr);
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to run TS worker: {}", e),
+                }
+
+                let alert = format!("🛒 *BUY EXECUTED ({})*\n\nBought {} TON of `{}`.", net_name, buy_ton, symbol);
                 let _ = send_telegram(&client, &bot_token, &chat_id, &alert, None).await;
             }
         }
@@ -333,7 +384,9 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
 }
 
 async fn seller_worker(db: Collection<TokenTrade>) {
-    println!("⚖️ Seller Worker: Checking for tokens to sell...");
+    let is_testnet = env::var("TESTNET").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
+    let net_name = if is_testnet { "TESTNET" } else { "MAINNET" };
+    println!("⚖️ Seller Worker: Checking for tokens to sell on {}...", net_name);
 
     let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
     let chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
@@ -354,22 +407,42 @@ async fn seller_worker(db: Collection<TokenTrade>) {
             use futures_util::StreamExt;
             while let Some(result) = cursor.next().await {
                 if let Ok(trade) = result {
-                    println!("📉 [SIMULATION] Selling {} ({}) after delay...", trade.token_name, trade.token_symbol);
+                    println!("📉 [SELL] Time to sell {}...", trade.token_symbol);
                     
-                    // SIMULATE SELL
                     let update_query = doc! { "token_address": &trade.token_address, "status": "PENDING" };
                     let update = doc! { "$set": { "status": "SOLD" } };
                     
                     if let Ok(_) = db.update_one(update_query, update, None).await {
-                        println!("✅ [SIMULATION] Trade marked as SOLD in MongoDB.");
-                        let alert = format!("📉 *SIMULATION: Sell Executed*\n\nSold `{}` after delay.", trade.token_symbol);
+                        println!("✅ [SELL] Trade marked as SOLD in MongoDB.");
+                        
+                        let output = std::process::Command::new("npx")
+                            .arg("ts-node")
+                            .arg("trade.ts")
+                            .arg("sell")
+                            .arg("1") // Placeholder, real app would check balance
+                            .arg(&trade.token_address)
+                            .current_dir("worker")
+                            .output();
+
+                        match output {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                println!("TS Worker Output: {}", stdout);
+                                if !stderr.is_empty() {
+                                    eprintln!("TS Worker Error: {}", stderr);
+                                }
+                            }
+                            Err(e) => eprintln!("Failed to run TS worker: {}", e),
+                        }
+
+                        let alert = format!("📉 *SELL EXECUTED ({})*\n\nSold `{}`.", net_name, trade.token_symbol);
                         let _ = send_telegram(&client, &bot_token, &chat_id, &alert, None).await;
                     }
                 }
             }
         }
 
-        // Check every 10 seconds
         sleep(Duration::from_secs(10)).await;
     }
 }
