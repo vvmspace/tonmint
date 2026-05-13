@@ -255,7 +255,28 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
                 "Unknown".to_string()
             };
 
+            // Stop Words Check
+            let stop_words_env = env::var("STOP_WORDS").unwrap_or_else(|_| "usdt,usdc,ton".to_string());
+            let stop_words: Vec<&str> = stop_words_env.split(',').map(|s| s.trim()).collect();
+            let name_lower = name.to_lowercase();
+            let symbol_lower = symbol.to_lowercase();
+            
+            let mut is_scam = false;
+            for word in stop_words {
+                let word_lower = word.to_lowercase();
+                if name_lower.contains(&word_lower) || symbol_lower.contains(&word_lower) {
+                    is_scam = true;
+                    break;
+                }
+            }
+
+            if is_scam {
+                println!("🚫 SCAM FILTERED: {} ({}) contains stop words.", name, symbol);
+                continue;
+            }
+
             println!("✨ NEW MINT: {} ({}) | Minter: {} | Balance: {}", name, symbol, minter_addr, minter_balance);
+
 
             let message1 = format!(
                 "💎 *New Jetton Minted!*\n\n\
