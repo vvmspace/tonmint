@@ -43,31 +43,54 @@ async function main() {
     if (action === "buy") {
         console.log(`Executing BUY on ${isTestnet ? "Testnet" : "Mainnet"}: Swapping ${amountStr} TON for Jetton ${jettonAddress.toString()}`);
         
-        const txParams = await router.getSwapTonToJettonTxParams({
-            userWalletAddress: wallet.address,
-            proxyTon: proxyTon,
-            offerAmount: toNano(amountStr),
-            askJettonAddress: jettonAddress,
-            minAskAmount: 1n, // Minimal slippage protection for testing
-            queryId: 12345n,
-        });
+        let success = false;
+        for (let attempt = 1; attempt <= 7; attempt++) {
+            try {
+                console.log(`Attempt ${attempt}/7 to get swap parameters...`);
+                const txParams = await router.getSwapTonToJettonTxParams({
+                    userWalletAddress: wallet.address,
+                    proxyTon: proxyTon,
+                    offerAmount: toNano(amountStr),
+                    askJettonAddress: jettonAddress,
+                    minAskAmount: 1n,
+                    queryId: 12345n,
+                });
 
-        console.log("Fetching seqno...");
-        const seqno = await contract.getSeqno();
-        console.log(`Sending transfer (seqno: ${seqno})...`);
-        await contract.sendTransfer({
-            seqno,
-            secretKey: keyPair.secretKey,
-            messages: [
-                internal({
-                    to: txParams.to,
-                    value: txParams.value,
-                    body: txParams.body,
-                })
-            ]
-        });
-        
-        console.log("BUY transaction sent successfully!");
+                console.log("Fetching seqno...");
+                const seqno = await contract.getSeqno();
+                
+                const transfer = contract.createTransfer({
+                    seqno,
+                    secretKey: keyPair.secretKey,
+                    messages: [
+                        internal({
+                            to: txParams.to,
+                            value: txParams.value,
+                            body: txParams.body,
+                        })
+                    ]
+                });
+
+                const hash = transfer.hash().toString("hex");
+                console.log(`TX_HASH: ${hash}`);
+                
+                await contract.send(transfer);
+                console.log("TX_SENT_SUCCESSFULLY");
+                success = true;
+                break;
+            } catch (err: any) {
+                console.error(`Attempt ${attempt} failed: ${err.message}`);
+                if (attempt < 7) {
+                    console.log("Waiting 15 seconds for next retry...");
+                    await new Promise(resolve => setTimeout(resolve, 15000));
+                }
+            }
+        }
+
+        if (!success) {
+            throw new Error("Failed to execute buy after 7 attempts. Most likely no liquidity pool yet.");
+        }
+
 
     } else if (action === "sell") {
         console.log(`Executing SELL on ${isTestnet ? "Testnet" : "Mainnet"}: Swapping ${amountStr} Jetton for TON`);
@@ -75,14 +98,16 @@ async function main() {
         const txParams = await router.getSwapJettonToTonTxParams({
             userWalletAddress: wallet.address,
             offerJettonAddress: jettonAddress,
-            offerAmount: toNano(amountStr), // Assumes 9 decimals, need to fetch real decimals ideally
+            offerAmount: toNano(amountStr),
             minAskAmount: 1n,
             proxyTon: proxyTon,
             queryId: 12345n,
         });
 
+        console.log("Fetching seqno...");
         const seqno = await contract.getSeqno();
-        await contract.sendTransfer({
+
+        const transfer = contract.createTransfer({
             seqno,
             secretKey: keyPair.secretKey,
             messages: [
@@ -94,9 +119,13 @@ async function main() {
             ]
         });
 
-        console.log("SELL transaction sent successfully!");
+        const hash = transfer.hash().toString("hex");
+        console.log(`TX_HASH: ${hash}`);
 
-    } else {
+        await contract.send(transfer);
+        console.log("TX_SENT_SUCCESSFULLY");
+    }
+ else {
         console.error("Invalid action");
     }
 }

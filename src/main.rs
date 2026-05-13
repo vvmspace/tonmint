@@ -353,40 +353,74 @@ async fn sniper_worker(db: Collection<TokenTrade>) {
                 last_buy_timestamp = now_ms;
                 println!("✅ [BUY] Trade recorded in MongoDB.");
                 
-                let output = std::process::Command::new("npx")
-                    .arg("ts-node")
-                    .arg("trade.ts")
-                    .arg("buy")
-                    .arg(buy_ton.to_string())
-                    .arg(&tx.account)
-                    .current_dir("worker")
-                    .output();
+                // Spawn trade worker in background to avoid blocking the scanner
+                let bot_token_clone = bot_token.clone();
+                let chat_id_clone = chat_id.clone();
+                let client_clone = client.clone();
+                let symbol_clone = symbol.clone();
+                let net_name_clone = net_name.to_string();
+                let buy_ton_clone = buy_ton;
+                let tx_account_clone = tx.account.clone();
+                let network_prefix_clone = network_prefix.to_string();
 
-                match output {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        println!("TS Worker Output: {}", stdout);
-                        if !stderr.is_empty() {
-                            eprintln!("TS Worker Error: {}", stderr);
+                tokio::spawn(async move {
+                    let output = std::process::Command::new("npx")
+                        .arg("ts-node")
+                        .arg("trade.ts")
+                        .arg("buy")
+                        .arg(buy_ton_clone.to_string())
+                        .arg(&tx_account_clone)
+                        .current_dir("worker")
+                        .output();
+
+                    let mut tx_link = String::new();
+                    let mut success = false;
+                    
+                    match output {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            println!("TS Worker Output for {}: {}", symbol_clone, stdout);
+                            
+                            for line in stdout.lines() {
+                                if line.starts_with("TX_HASH:") {
+                                    let hash = line.replace("TX_HASH:", "").trim().to_string();
+                                    tx_link = format!("\n🔗 [View Transaction](https://{}tonviewer.com/transaction/{})", network_prefix_clone, hash);
+                                }
+                            }
+
+                            if out.status.success() {
+                                success = true;
+                            } else {
+                                eprintln!("TS Worker Error for {} (Exit Code {}): {}", symbol_clone, out.status.code().unwrap_or(-1), stderr);
+                                let error_msg = format!("❌ *BUY FAILED ({})*\n\nToken: `{}`\nError: `{}`", net_name_clone, symbol_clone, stderr.lines().last().unwrap_or("Unknown error"));
+                                let _ = send_telegram(&client_clone, &bot_token_clone, &chat_id_clone, &error_msg, None).await;
+                            }
                         }
+                        Err(e) => eprintln!("Failed to spawn TS worker for {}: {}", symbol_clone, e),
                     }
-                    Err(e) => eprintln!("Failed to run TS worker: {}", e),
-                }
 
-                let alert = format!("🛒 *BUY EXECUTED ({})*\n\nBought {} TON of `{}`.", net_name, buy_ton, symbol);
-                let _ = send_telegram(&client, &bot_token, &chat_id, &alert, None).await;
+                    if success {
+                        let alert = format!("🛒 *BUY EXECUTED ({})*\n\nBought {} TON of `{}`.{}", net_name_clone, buy_ton_clone, symbol_clone, tx_link);
+                        let _ = send_telegram(&client_clone, &bot_token_clone, &chat_id_clone, &alert, None).await;
+                    }
+                });
             }
         }
+
+
 
         sleep(Duration::from_secs(2)).await;
     }
 }
 
+
 async fn seller_worker(db: Collection<TokenTrade>) {
     let is_testnet = env::var("TESTNET").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
     let net_name = if is_testnet { "TESTNET" } else { "MAINNET" };
+    let network_prefix = if is_testnet { "testnet." } else { "" };
     println!("⚖️ Seller Worker: Checking for tokens to sell on {}...", net_name);
+
 
     let bot_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
     let chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
@@ -424,24 +458,44 @@ async fn seller_worker(db: Collection<TokenTrade>) {
                             .current_dir("worker")
                             .output();
 
+                        let mut tx_link = String::new();
+                        let mut success = false;
+
                         match output {
                             Ok(out) => {
                                 let stdout = String::from_utf8_lossy(&out.stdout);
                                 let stderr = String::from_utf8_lossy(&out.stderr);
                                 println!("TS Worker Output: {}", stdout);
-                                if !stderr.is_empty() {
-                                    eprintln!("TS Worker Error: {}", stderr);
+                                
+                                // Parse TX_HASH from output
+                                for line in stdout.lines() {
+                                    if line.starts_with("TX_HASH:") {
+                                        let hash = line.replace("TX_HASH:", "").trim().to_string();
+                                        tx_link = format!("\n🔗 [View Transaction](https://{}tonviewer.com/transaction/{})", network_prefix, hash);
+                                    }
+                                }
+
+                                if out.status.success() {
+                                    success = true;
+                                } else {
+                                    eprintln!("TS Worker Error (Exit Code {}): {}", out.status.code().unwrap_or(-1), stderr);
+                                    let error_msg = format!("❌ *SELL FAILED ({})*\n\nToken: `{}`\nError: `{}`", net_name, trade.token_symbol, stderr.lines().last().unwrap_or("Unknown error"));
+                                    let _ = send_telegram(&client, &bot_token, &chat_id, &error_msg, None).await;
                                 }
                             }
                             Err(e) => eprintln!("Failed to run TS worker: {}", e),
                         }
 
-                        let alert = format!("📉 *SELL EXECUTED ({})*\n\nSold `{}`.", net_name, trade.token_symbol);
-                        let _ = send_telegram(&client, &bot_token, &chat_id, &alert, None).await;
+                        if success {
+                            let alert = format!("📉 *SELL EXECUTED ({})*\n\nSold `{}`.{}", net_name, trade.token_symbol, tx_link);
+                            let _ = send_telegram(&client, &bot_token, &chat_id, &alert, None).await;
+                        }
                     }
                 }
             }
         }
+
+
 
         sleep(Duration::from_secs(10)).await;
     }
